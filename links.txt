@@ -1,0 +1,3 @@
+Deployed version: https://quantic-capstone-five.vercel.app/
+Agile task board: https://trello.com/b/m4eECqmj/quantic-msse-2026-capstone-project
+Presentation: https://youtu.be/lLZFeHi74mc
