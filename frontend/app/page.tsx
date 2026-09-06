@@ -346,7 +346,7 @@ export default function Home() {
                       : "Analyze Match"}
                   </button>
                   <p className="text-xs text-muted-foreground/60">
-                    Powered by Llama 3.3 — takes about 15 seconds
+                    Powered by GPT-OSS 120B — takes about 15 seconds
                   </p>
                 </div>
 

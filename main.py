@@ -247,12 +247,14 @@ async def analyze_cv(request: AnalysisRequest, client_request: Request):
     
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": "You are a career consultant specialized in high-end recruitment analysis. Your output is always strictly structured JSON. You must be extremely literal during extraction and never hallucinate data that isn't in the provided text."},
                 {"role": "user", "content": prompt}
             ],
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            max_tokens=8000,
+            reasoning_effort="low"
         )
         
         result = json.loads(response.choices[0].message.content.strip())
@@ -286,7 +288,7 @@ async def generate_cover_letter(request: CoverLetterRequest):
     
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": "You are an executive career coach and expert cover letter writer."},
                 {"role": "user", "content": prompt}
