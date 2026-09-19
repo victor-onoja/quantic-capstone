@@ -365,8 +365,13 @@ JD_ONLY_TERMS = [
 ]
 
 
-def _claimed_terms(text):
-    return [term for term in JD_ONLY_TERMS if re.search(r"(?<!\w)" + re.escape(term), text.lower())]
+# The letter may call real cost-saving work "FinOps": that frames what the CV shows rather than claiming
+# a tool the candidate never used. Suggestions stay strict, because they are pasted into the CV itself.
+LETTER_TERMS = [term for term in JD_ONLY_TERMS if term != "finops"]
+
+
+def _claimed_terms(text, terms=JD_ONLY_TERMS):
+    return [term for term in terms if re.search(r"(?<!\w)" + re.escape(term), text.lower())]
 
 
 class TestBenchmarkGrounding:
@@ -387,5 +392,5 @@ class TestBenchmarkGrounding:
         letter = response.json()["cover_letter"]
         honest = re.compile(r"not yet|haven't|have not|no direct|new to|keen to|eager to|look forward to", re.I)
         for sentence in re.split(r"(?<=[.!?])\s+", letter):
-            claimed = _claimed_terms(sentence)
+            claimed = _claimed_terms(sentence, LETTER_TERMS)
             assert not claimed or honest.search(sentence), f"Letter claims {claimed}: {sentence}"
