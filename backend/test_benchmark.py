@@ -227,11 +227,11 @@ class TestBenchmarkSuggestions:
 
     @pytest.mark.benchmark
     def test_suggestions_count(self, analysis_result):
-        """Exactly 5 suggestions should be returned (as per the prompt)."""
+        """Up to 5 suggestions: the prompt asks for fewer rather than padding, and grounding drops any it empties."""
         suggestions = analysis_result["suggestions"]
         assert isinstance(suggestions, list)
-        assert len(suggestions) == 5, \
-            f"Expected 5 suggestions, got {len(suggestions)}"
+        assert 1 <= len(suggestions) <= 5, \
+            f"Expected 1-5 suggestions, got {len(suggestions)}"
 
     @pytest.mark.benchmark
     def test_suggestion_structure(self, analysis_result):
@@ -348,3 +348,44 @@ class TestBenchmarkSemanticExpectations:
         name = analysis_result["extraction"]["cv_data"]["personal_info"]["name"]
         assert "alex" in name.lower() and "morgan" in name.lower(), \
             f"Expected 'Alex Morgan', got '{name}'"
+
+
+
+# ===========================================================================
+# GROUNDING — suggestions are pasted into the CV and the letter is signed,
+# so neither may invent skills
+# ===========================================================================
+
+import re
+
+# Asked for by the benchmark JD but absent from the benchmark CV (checked by grep).
+JD_ONLY_TERMS = [
+    "pagerduty", "pulumi", "datadog", "jaeger", "vault", "gcp", "gke", "bigquery", "cloud build",
+    "finops", "clearance", "jenkins", "network segmentation", "secrets management", "disaster recovery",
+]
+
+
+def _claimed_terms(text):
+    return [term for term in JD_ONLY_TERMS if re.search(r"(?<!\w)" + re.escape(term), text.lower())]
+
+
+class TestBenchmarkGrounding:
+    """Validate that generated text only claims what the CV shows."""
+
+    @pytest.mark.benchmark
+    def test_suggestions_do_not_claim_missing_skills(self, analysis_result):
+        """No suggestion may mention a JD skill the CV lacks."""
+        for suggestion in analysis_result["suggestions"]:
+            claimed = _claimed_terms(suggestion["replacement_text"])
+            assert not claimed, f"Suggestion '{suggestion['id']}' claims {claimed}: {suggestion['replacement_text']}"
+
+    @pytest.mark.benchmark
+    def test_cover_letter_does_not_claim_missing_skills(self, client, test_cv, test_jd):
+        """The letter may only mention a missing JD skill to say the candidate has not used it yet."""
+        response = client.post("/generate-cover-letter", json={"cv_text": test_cv, "job_description": test_jd})
+        assert response.status_code == 200, f"Cover letter failed: {response.text}"
+        letter = response.json()["cover_letter"]
+        honest = re.compile(r"not yet|haven't|have not|no direct|new to|keen to|eager to|look forward to", re.I)
+        for sentence in re.split(r"(?<=[.!?])\s+", letter):
+            claimed = _claimed_terms(sentence)
+            assert not claimed or honest.search(sentence), f"Letter claims {claimed}: {sentence}"

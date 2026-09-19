@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import re
 import time
 from typing import Optional, List
 import tempfile
@@ -155,6 +156,106 @@ class CoverLetterRequest(BaseModel):
     cv_text: str
     job_description: str
 
+# --- GROUNDING: stop suggestions and cover letters inventing skills ---
+# The writing prompts alone do not stop the model adding tools, domains or metrics the CV
+# never mentions, so every generated text goes through a fact-check pass and a code check.
+# The check runs on the small model, which Groq rate-limits separately from the analysis model.
+GROUNDING_MODEL = "openai/gpt-oss-20b"
+
+
+def _grounding_prompt(cv_text: str, texts: List[str]) -> str:
+    numbered = "\n\n".join(f"[{i}] {text}" for i, text in enumerate(texts))
+    return f"""
+    You are a strict fact-checker. The candidate will put each numbered text into their CV or sign it as a cover letter.
+
+    For each text, find every claim the CV does not support: a skill, tool, technology, certification, domain,
+    responsibility, achievement, number or metric that the CV does not state. Moving a metric onto a different
+    achievement than the one the CV attaches it to is also unsupported.
+
+    These are fine and must be kept: rewording, reordering and emphasis; combining facts the CV states; tying a real
+    CV fact to the job ("this matches your need for..."); saying plainly that the candidate has not used something yet.
+
+    Then return each text with the unsupported claims removed, changing as little as possible and keeping the tone,
+    format and line breaks. If nothing supported is left, return an empty string for that text.
+
+    CV:
+    {cv_text}
+
+    TEXTS:
+    {numbered}
+
+    Return ONLY a JSON object: {{"results": [{{"index": 0, "unsupported": ["each unsupported claim"], "text": "corrected text"}}]}}
+    """
+
+
+def remove_unsupported_claims(cv_text: str, texts: List[str]) -> List[str]:
+    """Return the texts with claims the CV does not support removed. On any failure, return them unchanged."""
+    try:
+        response = client.chat.completions.create(
+            model=GROUNDING_MODEL,
+            messages=[{"role": "user", "content": _grounding_prompt(cv_text, texts)}],
+            response_format={"type": "json_object"},
+            max_tokens=8000,
+            reasoning_effort="low"
+        )
+        results = json.loads(response.choices[0].message.content)["results"]
+    except Exception as e:
+        print(f"GROUNDING CHECK FAILED, texts returned unchecked: {e}")
+        return texts
+
+    corrected = list(texts)
+    for item in results:
+        index, text = item.get("index"), item.get("text")
+        if isinstance(index, int) and 0 <= index < len(texts) and isinstance(text, str):
+            corrected[index] = text.strip()
+    return corrected
+
+
+_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def _skill_phrases(skill: str) -> List[str]:
+    """Split a missing-skill entry into phrases to look for.
+
+    "GCP (GKE, Cloud Build)" gives ["gcp", "gke", "cloud build"]; "FinOps frameworks" also gives "finops",
+    because product-style names (inner or repeated capitals) are specific enough to match on their own.
+    """
+    parts = [part.strip() for part in re.split(r"[(),/;]|\band\b|\bor\b", skill)]
+    names = [word for part in parts for word in part.split() if re.search(r"[a-z][A-Z]|[A-Z].*[A-Z]", word)]
+    return [phrase.lower() for phrase in parts + names if len(phrase) >= 2]
+
+
+def _mentions(text: str, phrase: str) -> bool:
+    return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text) is not None
+
+
+def drop_ungrounded_suggestions(result: dict, cv_text: str) -> dict:
+    """Backstop after the fact-check: drop suggestions that still name a missing skill or a number the CV lacks."""
+    cv = cv_text.lower()
+    absent = {
+        phrase
+        for skill in result.get("missing_skills") or []
+        if isinstance(skill, str)
+        for phrase in _skill_phrases(skill)
+        if not _mentions(cv, phrase)
+    }
+    cv_numbers = set(_NUMBER.findall(cv_text))
+
+    kept = []
+    for suggestion in result.get("suggestions") or []:
+        text = str(suggestion.get("replacement_text", "")).strip()
+        if not text or text == str(suggestion.get("original_text", "")).strip():
+            continue  # nothing left after grounding, or no change to suggest
+        claimed = sorted(phrase for phrase in absent if _mentions(text.lower(), phrase))
+        invented = sorted(set(_NUMBER.findall(text)) - cv_numbers)
+        if claimed or invented:
+            print(f"DROPPED UNGROUNDED SUGGESTION {suggestion.get('id')}: skills={claimed} numbers={invented}")
+            continue
+        kept.append(suggestion)
+    result["suggestions"] = kept
+    return result
+
+
 @app.get("/")
 async def root():
     return {"status": "online", "db": bool(DATABASE_URL)}
@@ -191,13 +292,19 @@ async def analyze_cv(request: AnalysisRequest, client_request: Request):
     
     STEP 3: Generate a match score (0-100) and match status.
     
-    STEP 4: Provide EXACTLY 5 high-impact, context-relevant improvement suggestions. 
+    STEP 4: Provide UP TO 5 high-impact, context-relevant improvement suggestions. Fewer is right when the CV is already strong: never pad the list with a suggestion that needs an invented fact.
     - DO NOT BE CARELESS. Your suggestions must reflect years of recruitment wisdom.
     - Each suggestion must reference a `target_id` from the extracted CV data.
     - `type` MUST be one of: "summary", "experience_bullet", "project_description", "education_detail", "add_experience_bullet".
-    - Use "add_experience_bullet" to suggest a NEW bullet point for an experience record (target_id should be the exp_id).
-    - Provide the `original_text` (empty for additions) and a `replacement_text` that demonstrates the candidate's value proposition specifically for this JD without fabricating achievements.
+    - Use "add_experience_bullet" to suggest a NEW bullet point for an experience record (target_id should be the exp_id). Only use it to surface something the CV already shows elsewhere (for example a listed skill or project) that this role's bullets do not mention yet.
+    - Provide the `original_text` (empty for additions) and a `replacement_text` that demonstrates the candidate's value proposition specifically for this JD.
+    - Provide `evidence`: the exact CV text that every fact in `replacement_text` comes from.
     - Ensure the `reason` explains the strategic advantage of this change.
+
+    GROUNDING RULES FOR `replacement_text` (the candidate pastes it straight into their CV, so an invented claim becomes a lie on their CV):
+    - Every skill, tool, technology, certification, domain and responsibility in it must already appear in the CV. Better wording, ordering and emphasis are allowed; new facts are not.
+    - Anything the JD asks for that the CV does not show belongs in `missing_skills` and `skill_gap_courses`, never in `replacement_text` — not as "exposure to", "familiar with", "applicable to", or "ready for" either.
+    - Every number, percentage and metric must be copied exactly from the CV. Never add a metric; if a bullet has none, strengthen the wording without one.
     
     STEP 5: Suggest 3-4 professional learning paths or course topics to strengthen the candidate specifically for this role based on their actual missing skills.
     
@@ -231,7 +338,7 @@ async def analyze_cv(request: AnalysisRequest, client_request: Request):
         "jd_data": {{ "role": "", "skills": [], "responsibilities": [], "qualifications": [] }}
       }},
       "suggestions": [
-        {{ "id": "s1", "target_id": "b_1", "type": "experience_bullet", "issue": "", "original_text": "", "replacement_text": "", "reason": "" }}
+        {{ "id": "s1", "target_id": "b_1", "type": "experience_bullet", "issue": "", "original_text": "", "replacement_text": "", "evidence": "", "reason": "" }}
       ],
       "skill_gap_courses": [{{ "topic": "string", "description": "string" }}]
     }}
@@ -242,7 +349,7 @@ async def analyze_cv(request: AnalysisRequest, client_request: Request):
     3. TARGETED SUGGESTIONS: Only suggest improvements for sections that exist.
     4. NON-CV CONTENT: If the document isn't a CV, set `is_cv` to false.
     5. PROFESSIONAL TONE: Suggestions should sound like they come from a top-tier career advisor.
-    6. NO FABRICATION: Do not suggest adding experience or skills the candidate clearly does not have.
+    6. NO FABRICATION: Never put a skill, tool, metric or experience into a suggestion unless the CV states it.
     """
     
     try:
@@ -258,7 +365,14 @@ async def analyze_cv(request: AnalysisRequest, client_request: Request):
         )
         
         result = json.loads(response.choices[0].message.content.strip())
-        return result
+
+        suggestions = [s for s in result.get("suggestions") or [] if isinstance(s, dict)]
+        if suggestions:
+            texts = [str(s.get("replacement_text", "")) for s in suggestions]
+            for suggestion, text in zip(suggestions, remove_unsupported_claims(cv_text, texts)):
+                suggestion["replacement_text"] = text
+        result["suggestions"] = suggestions
+        return drop_ungrounded_suggestions(result, request.cv_text)
 
     except Exception as e:
         print(f"ANALYSIS ERROR: {e}")
@@ -282,6 +396,11 @@ async def generate_cover_letter(request: CoverLetterRequest):
     2. Mention specific tools or achievements found in the CV that match the JD.
     3. Keep it under 350 words.
     4. Use a modern, professional tone (no generic "To Whom It May Concern").
+
+    HONESTY RULES (the candidate signs this letter, so every claim must be true):
+    5. Only claim skills, tools, certifications, domains and experience that appear in the CV. Never describe the candidate as proficient in, experienced with, or familiar with anything the CV does not show.
+    6. Use only numbers and metrics that appear in the CV, copied exactly.
+    7. For JD requirements the CV does not show, either leave them out or, at most once, say plainly that the candidate has not used it yet and name the closest experience the CV does show.
     
     Return ONLY the cover letter text.
     """
@@ -290,12 +409,23 @@ async def generate_cover_letter(request: CoverLetterRequest):
         response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[
-                {"role": "system", "content": "You are an executive career coach and expert cover letter writer."},
+                {"role": "system", "content": "You are an executive career coach and expert cover letter writer. You never claim a skill, tool, metric or experience that the candidate's CV does not show."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7 
+            temperature=0.5,
+            max_tokens=4000,
+            reasoning_effort="low"
         )
-        return {"cover_letter": response.choices[0].message.content.strip()}
+        choice = response.choices[0]
+        letter = (choice.message.content or "").strip()
+        if not letter:
+            raise RuntimeError(f"Model returned no cover letter (finish_reason={choice.finish_reason})")
+        # Checked line by line (each paragraph or bullet): the checker misses claims buried in a long block.
+        lines = letter.split("\n")
+        filled = [i for i, line in enumerate(lines) if line.strip()]
+        for i, text in zip(filled, remove_unsupported_claims(safe_cv, [lines[i] for i in filled])):
+            lines[i] = text
+        return {"cover_letter": re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() or letter}
     except Exception as e:
         print(f"COVER LETTER ERROR: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate cover letter.")        
